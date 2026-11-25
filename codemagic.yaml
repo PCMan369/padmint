@@ -127,3 +127,216 @@ workflows:
     artifacts:
       - logs/*
       - stage0-out/*
+
+  # Lightweight probe for the macOS-SDK BZip2/ZLIB link failure seen in
+  # harkinianpad-anchor-stage0. Configures a throwaway project (no dependency
+  # fetch, no app compile or link) with configure-ios.sh's toolchain flags and
+  # records how ZLIB and BZip2 are found. Independent of the full diagnostic.
+  harkinianpad-cmake-probe:
+    name: HarkinianPad CMake find probe (ZLIB, BZip2)
+    instance_type: mac_mini_m2
+    max_build_duration: 10
+
+    environment:
+      xcode: 26.3
+      vars:
+        STAGE0_REPO_URL: https://github.com/PCMan369/harkinianpad.git
+        STAGE0_BRANCH: anchor-ios-port
+
+    scripts:
+      - name: Check out fork branch
+        script: |
+          set -euo pipefail
+          mkdir -p "$CM_BUILD_DIR/logs" "$CM_BUILD_DIR/diagnostics"
+          rm -rf "$CM_BUILD_DIR/harkinianpad-src"
+          git clone --branch "$STAGE0_BRANCH" --single-branch --no-tags \
+            "$STAGE0_REPO_URL" "$CM_BUILD_DIR/harkinianpad-src"
+          cd "$CM_BUILD_DIR/harkinianpad-src"
+          test "$(git remote get-url origin)" = "$STAGE0_REPO_URL"
+          test "$(git symbolic-ref --short HEAD)" = "$STAGE0_BRANCH"
+          test "$(git rev-parse HEAD)" = "$(git rev-parse "refs/remotes/origin/$STAGE0_BRANCH")"
+          echo "repository: $(git remote get-url origin)" | tee "$CM_BUILD_DIR/diagnostics/identity.txt"
+          echo "branch: $STAGE0_BRANCH" | tee -a "$CM_BUILD_DIR/diagnostics/identity.txt"
+          echo "commit: $(git rev-parse HEAD)" | tee -a "$CM_BUILD_DIR/diagnostics/identity.txt"
+
+      - name: Record toolchain and environment
+        script: |
+          set -uo pipefail
+          {
+            echo "== cmake"; command -v cmake; cmake --version
+            echo "== xcode"; xcode-select -p; xcodebuild -version
+            echo "== sdk paths"
+            echo "iphoneos: $(xcrun --sdk iphoneos --show-sdk-path)"
+            echo "macosx:   $(xcrun --sdk macosx --show-sdk-path)"
+            echo "== environment (allowlist)"
+            env | grep -E '^(SDKROOT|DEVELOPER_DIR|MACOSX_DEPLOYMENT_TARGET|IPHONEOS_DEPLOYMENT_TARGET|DEPLOYMENT_TARGET|CMAKE_[A-Z_]*|CC|CXX|CFLAGS|CXXFLAGS|CPPFLAGS|LDFLAGS|PKG_CONFIG[A-Z_]*|HOMEBREW_PREFIX|BUNDLE_ID|DEVELOPMENT_TEAM|PATH)=' | sort
+            echo "== libbz2 / libz stubs per SDK"
+            for sdk in iphoneos macosx; do
+              p="$(xcrun --sdk $sdk --show-sdk-path)"
+              for lib in libbz2 libz; do
+                f="$p/usr/lib/$lib.tbd"
+                echo "--- $f"; ls -l "$f" 2>&1
+                grep -m3 -E '^(targets:|install-name:)' "$f" 2>&1
+              done
+            done
+          } > "$CM_BUILD_DIR/diagnostics/environment.txt" 2>&1
+          cat "$CM_BUILD_DIR/diagnostics/environment.txt"
+
+      - name: CMake find probe (ZLIB, BZip2)
+        script: |
+          set -uo pipefail
+          D="$CM_BUILD_DIR/diagnostics"
+          P="$CM_BUILD_DIR/probe"
+          rm -rf "$P"; mkdir -p "$P/src"
+          # The probe repeats the toolchain flags of scripts/configure-ios.sh.
+          # Fail loudly if the script no longer contains them.
+          for flag in -GXcode -DCMAKE_SYSTEM_NAME=iOS -DCMAKE_OSX_ARCHITECTURES=arm64 \
+                      -DCMAKE_BUILD_TYPE:STRING=Release -DENABLE_SCRIPTING=OFF \
+                      -DCMAKE_OSX_DEPLOYMENT_TARGET= -DCMAKE_SYSTEM_VERSION= -DPLATFORM=; do
+            grep -qF -- "$flag" "$CM_BUILD_DIR/harkinianpad-src/scripts/configure-ios.sh" \
+              || { echo "configure-ios.sh no longer contains $flag; update the probe" | tee "$D/probe-error.txt" >&2; echo 2 > "$D/probe.exit"; exit 0; }
+          done
+          cat > "$P/src/CMakeLists.txt" <<'CMAKE'
+          cmake_minimum_required(VERSION 3.26.0)
+          # Mirrors the order in Shipwright CMakeLists.txt: system version and
+          # deployment target are set before project(); ZLIB is found before
+          # OBJCXX is enabled, BZip2 after (as StormLib does).
+          if(CMAKE_SYSTEM_NAME STREQUAL "iOS")
+              set(CMAKE_SYSTEM_VERSION "${DEPLOYMENT_TARGET}" CACHE STRING "" FORCE)
+          endif()
+          set(CMAKE_OSX_DEPLOYMENT_TARGET "10.15" CACHE STRING "Minimum OS X deployment version")
+          project(ConfigureProbe LANGUAGES C CXX)
+          function(probe_dump)
+              foreach(v ${ARGN})
+                  message(STATUS "probe: ${v} = ${${v}}")
+              endforeach()
+          endfunction()
+          probe_dump(CMAKE_VERSION CMAKE_GENERATOR CMAKE_SYSTEM_NAME CMAKE_OSX_SYSROOT
+                     _CMAKE_OSX_SYSROOT_PATH CMAKE_OSX_DEPLOYMENT_TARGET
+                     CMAKE_FIND_ROOT_PATH CMAKE_FIND_ROOT_PATH_MODE_LIBRARY
+                     CMAKE_FIND_ROOT_PATH_MODE_INCLUDE CMAKE_FIND_ROOT_PATH_MODE_PACKAGE
+                     CMAKE_PREFIX_PATH CMAKE_SYSTEM_PREFIX_PATH
+                     CMAKE_PLATFORM_IMPLICIT_LINK_DIRECTORIES)
+          find_package(ZLIB)
+          enable_language(OBJCXX)
+          find_package(BZip2)
+          probe_dump(ZLIB_FOUND ZLIB_LIBRARIES ZLIB_INCLUDE_DIRS BZIP2_FOUND BZIP2_LIBRARIES
+                     BZIP2_INCLUDE_DIR)
+          CMAKE
+          DT="${DEPLOYMENT_TARGET:-15.0}"
+          cmake -Wno-unused-cli -S "$P/src" -B "$P/build" \
+            -GXcode \
+            -DCMAKE_SYSTEM_NAME=iOS \
+            -DCMAKE_SYSTEM_VERSION="$DT" \
+            -DDEPLOYMENT_TARGET="$DT" \
+            -DCMAKE_OSX_DEPLOYMENT_TARGET="$DT" \
+            -DCMAKE_OSX_ARCHITECTURES=arm64 \
+            -DCMAKE_BUILD_TYPE:STRING=Release \
+            -DENABLE_SCRIPTING=OFF \
+            -DPLATFORM="${IOS_PLATFORM:-OS64COMBINED}" \
+            --debug-find-pkg=ZLIB,BZip2 2>&1 | tee "$D/probe-debug-find.log"
+          rc="${PIPESTATUS[0]}"
+          echo "$rc" > "$D/probe.exit"
+          cp "$P/build/CMakeCache.txt" "$D/probe-CMakeCache.txt" 2>/dev/null || true
+          exit 0
+
+      - name: Report probe result
+        script: |
+          set -uo pipefail
+          D="$CM_BUILD_DIR/diagnostics"
+          rc="$(cat "$D/probe.exit" 2>/dev/null || echo unknown)"
+          echo "probe exit status: $rc" | tee -a "$D/identity.txt"
+          ls -l "$D"
+          [ "$rc" = "0" ]
+
+    artifacts:
+      - diagnostics/*
+
+  # Full configure-only diagnostic: fetches the pinned sources, runs the real
+  # configure-ios.sh --soh and collects CMake's own files. Run it only if the
+  # probe (harkinianpad-cmake-probe) is not conclusive. It never compiles,
+  # links, packages or signs the app.
+  harkinianpad-cmake-diagnostic:
+    name: HarkinianPad CMake full configure diagnostic (no compile)
+    instance_type: mac_mini_m2
+    max_build_duration: 20
+
+    environment:
+      xcode: 26.3
+      vars:
+        STAGE0_REPO_URL: https://github.com/PCMan369/harkinianpad.git
+        STAGE0_BRANCH: anchor-ios-port
+
+    scripts:
+      - name: Check out fork branch
+        script: |
+          set -euo pipefail
+          mkdir -p "$CM_BUILD_DIR/logs" "$CM_BUILD_DIR/diagnostics"
+          rm -rf "$CM_BUILD_DIR/harkinianpad-src"
+          git clone --branch "$STAGE0_BRANCH" --single-branch --no-tags \
+            "$STAGE0_REPO_URL" "$CM_BUILD_DIR/harkinianpad-src"
+          cd "$CM_BUILD_DIR/harkinianpad-src"
+          test "$(git remote get-url origin)" = "$STAGE0_REPO_URL"
+          test "$(git symbolic-ref --short HEAD)" = "$STAGE0_BRANCH"
+          test "$(git rev-parse HEAD)" = "$(git rev-parse "refs/remotes/origin/$STAGE0_BRANCH")"
+          echo "repository: $(git remote get-url origin)" | tee "$CM_BUILD_DIR/diagnostics/identity.txt"
+          echo "branch: $STAGE0_BRANCH" | tee -a "$CM_BUILD_DIR/diagnostics/identity.txt"
+          echo "commit: $(git rev-parse HEAD)" | tee -a "$CM_BUILD_DIR/diagnostics/identity.txt"
+
+      - name: Record toolchain and environment
+        script: |
+          set -uo pipefail
+          {
+            echo "== cmake"; command -v cmake; cmake --version
+            echo "== xcode"; xcode-select -p; xcodebuild -version
+            echo "== sdk paths"
+            echo "iphoneos: $(xcrun --sdk iphoneos --show-sdk-path)"
+            echo "macosx:   $(xcrun --sdk macosx --show-sdk-path)"
+            echo "== environment (allowlist)"
+            env | grep -E '^(SDKROOT|DEVELOPER_DIR|MACOSX_DEPLOYMENT_TARGET|IPHONEOS_DEPLOYMENT_TARGET|DEPLOYMENT_TARGET|CMAKE_[A-Z_]*|CC|CXX|CFLAGS|CXXFLAGS|CPPFLAGS|LDFLAGS|PKG_CONFIG[A-Z_]*|HOMEBREW_PREFIX|BUNDLE_ID|DEVELOPMENT_TEAM|PATH)=' | sort
+            echo "== libbz2 / libz stubs per SDK"
+            for sdk in iphoneos macosx; do
+              p="$(xcrun --sdk $sdk --show-sdk-path)"
+              for lib in libbz2 libz; do
+                f="$p/usr/lib/$lib.tbd"
+                echo "--- $f"; ls -l "$f" 2>&1
+                grep -m3 -E '^(targets:|install-name:)' "$f" 2>&1
+              done
+            done
+          } > "$CM_BUILD_DIR/diagnostics/environment.txt" 2>&1
+          cat "$CM_BUILD_DIR/diagnostics/environment.txt"
+
+      - name: Fetch pinned sources and port archive
+        script: |
+          set -euo pipefail
+          cd "$CM_BUILD_DIR/harkinianpad-src"
+          { scripts/clone-sources.sh && scripts/verify-sources.py && scripts/generate-port-archive.sh; } 2>&1 | tee "$CM_BUILD_DIR/logs/prepare-sources.log"
+
+      - name: Configure only (iOS device, no compile)
+        script: |
+          set +e
+          cd "$CM_BUILD_DIR/harkinianpad-src"
+          scripts/configure-ios.sh --soh 2>&1 | tee "$CM_BUILD_DIR/logs/configure-ios.log"
+          echo "${PIPESTATUS[0]}" > "$CM_BUILD_DIR/diagnostics/configure.exit"
+          exit 0
+
+      - name: Collect CMake diagnostics
+        script: |
+          set -uo pipefail
+          B="$CM_BUILD_DIR/harkinianpad-src/build-ios-soh"
+          D="$CM_BUILD_DIR/diagnostics"
+          for f in CMakeCache.txt CMakeFiles/CMakeConfigureLog.yaml; do
+            if [ -f "$B/$f" ]; then cp "$B/$f" "$D/"; else echo "missing: $f" | tee -a "$D/missing.txt"; fi
+          done
+          for f in CMakeSystem.cmake CMakeCXXCompiler.cmake; do
+            p="$(find "$B/CMakeFiles" -maxdepth 2 -name "$f" 2>/dev/null | head -n1)"
+            if [ -n "$p" ]; then cp "$p" "$D/"; else echo "missing: $f" | tee -a "$D/missing.txt"; fi
+          done
+          rc="$(cat "$D/configure.exit" 2>/dev/null || echo unknown)"
+          echo "configure exit status: $rc" | tee -a "$D/identity.txt"
+          ls -l "$D"
+          [ "$rc" = "0" ]
+
+    artifacts:
+      - diagnostics/*
+      - logs/*

@@ -107,6 +107,16 @@ workflows:
       - name: Build unsigned device app
         script: |
           set -euo pipefail
+          # Same safeguard as padmint/cli.py (HOST_BUILD_VARIABLES): a device build must
+          # not inherit the Mac SDK or libraries. Codemagic exports SDKROOT as the macOS SDK,
+          # which made CMake find macOS libbz2/libz for the iOS link.
+          for var in SDKROOT CPATH LIBRARY_PATH; do
+            if value="$(printenv "$var")"; then
+              echo "Removing inherited $var=$value for the iOS device build" | tee -a "$CM_BUILD_DIR/logs/build-env-sanitize.log"
+              unset "$var"
+            fi
+          done
+          echo "SDKROOT, CPATH and LIBRARY_PATH are now unset for the build" | tee -a "$CM_BUILD_DIR/logs/build-env-sanitize.log"
           cd "$CM_BUILD_DIR/harkinianpad-src"
           scripts/build-ios.sh --device 2>&1 | tee "$CM_BUILD_DIR/logs/build-ios.log"
 

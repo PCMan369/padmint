@@ -240,14 +240,70 @@ workflows:
           cp "$P/build/CMakeCache.txt" "$D/probe-CMakeCache.txt" 2>/dev/null || true
           exit 0
 
+      - name: CMake find probe, sanitized environment
+        script: |
+          set -uo pipefail
+          D="$CM_BUILD_DIR/diagnostics"
+          P="$CM_BUILD_DIR/probe"
+          # Same project and flags as the probe above (it wrote $P/src), but without the
+          # inherited SDKROOT, CPATH and LIBRARY_PATH, as padmint/cli.py does for device builds.
+          if [ ! -f "$P/src/CMakeLists.txt" ]; then
+            echo "probe project missing; the previous step stopped early" | tee "$D/probe-sanitized-error.txt" >&2
+            echo 2 > "$D/probe-sanitized.exit"; exit 0
+          fi
+          for var in SDKROOT CPATH LIBRARY_PATH; do
+            if value="$(printenv "$var")"; then echo "Inherited $var=$value (removed for this probe)" | tee -a "$D/probe-sanitized-env.txt"; fi
+          done
+          rm -rf "$P/build-sanitized"
+          DT="${DEPLOYMENT_TARGET:-15.0}"
+          env -u SDKROOT -u CPATH -u LIBRARY_PATH \
+            cmake -Wno-unused-cli -S "$P/src" -B "$P/build-sanitized" \
+            -GXcode \
+            -DCMAKE_SYSTEM_NAME=iOS \
+            -DCMAKE_SYSTEM_VERSION="$DT" \
+            -DDEPLOYMENT_TARGET="$DT" \
+            -DCMAKE_OSX_DEPLOYMENT_TARGET="$DT" \
+            -DCMAKE_OSX_ARCHITECTURES=arm64 \
+            -DCMAKE_BUILD_TYPE:STRING=Release \
+            -DENABLE_SCRIPTING=OFF \
+            -DPLATFORM="${IOS_PLATFORM:-OS64COMBINED}" \
+            --debug-find-pkg=ZLIB,BZip2 2>&1 | tee "$D/probe-sanitized-debug-find.log"
+          echo "${PIPESTATUS[0]}" > "$D/probe-sanitized.exit"
+          cp "$P/build-sanitized/CMakeCache.txt" "$D/probe-sanitized-CMakeCache.txt" 2>/dev/null || true
+          exit 0
+
       - name: Report probe result
         script: |
           set -uo pipefail
           D="$CM_BUILD_DIR/diagnostics"
-          rc="$(cat "$D/probe.exit" 2>/dev/null || echo unknown)"
-          echo "probe exit status: $rc" | tee -a "$D/identity.txt"
+          classify() {
+            line="$(grep -m1 "^-- Found $3:" "$1" 2>/dev/null || true)"
+            case "$line" in
+              "") sdk="not found" ;;
+              *MacOSX*) sdk="macOS SDK" ;;
+              *iPhoneOS*) sdk="iPhoneOS SDK" ;;
+              *iPhoneSimulator*) sdk="iPhoneSimulator SDK" ;;
+              *) sdk="other: $line" ;;
+            esac
+            printf '%-22s %-6s -> %s\n' "$2" "$3" "$sdk"
+          }
+          {
+            echo "Which SDK did each library resolve to?"
+            classify "$D/probe-debug-find.log" "inherited environment" ZLIB
+            classify "$D/probe-debug-find.log" "inherited environment" BZip2
+            classify "$D/probe-sanitized-debug-find.log" "sanitized environment" ZLIB
+            classify "$D/probe-sanitized-debug-find.log" "sanitized environment" BZip2
+            echo
+            echo "CMAKE_OSX_SYSROOT reported by each probe:"
+            echo "inherited:  $(grep -m1 'probe: CMAKE_OSX_SYSROOT' "$D/probe-debug-find.log" 2>/dev/null)"
+            echo "sanitized:  $(grep -m1 'probe: CMAKE_OSX_SYSROOT' "$D/probe-sanitized-debug-find.log" 2>/dev/null)"
+          } | tee "$D/probe-summary.txt"
+          rc1="$(cat "$D/probe.exit" 2>/dev/null || echo unknown)"
+          rc2="$(cat "$D/probe-sanitized.exit" 2>/dev/null || echo unknown)"
+          echo "probe exit status: $rc1" | tee -a "$D/identity.txt"
+          echo "sanitized probe exit status: $rc2" | tee -a "$D/identity.txt"
           ls -l "$D"
-          [ "$rc" = "0" ]
+          [ "$rc1" = "0" ] && [ "$rc2" = "0" ]
 
     artifacts:
       - diagnostics/*

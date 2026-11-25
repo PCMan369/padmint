@@ -27,3 +27,103 @@ workflows:
 
     artifacts:
       - out/*.ipa
+
+  # Stage 0 control build: compiles the PCMan369/harkinianpad fork branch as it
+  # is today. It does not use scripts/github-build.py (that script builds the
+  # latest published release, never a development branch) and it does not
+  # package or sign anything.
+  harkinianpad-anchor-stage0:
+    name: HarkinianPad Stage 0 baseline (anchor-ios-port, unsigned)
+    instance_type: mac_mini_m2
+    max_build_duration: 120
+
+    environment:
+      xcode: 26.3
+      vars:
+        STAGE0_REPO_URL: https://github.com/PCMan369/harkinianpad.git
+        STAGE0_BRANCH: anchor-ios-port
+
+    scripts:
+      - name: Verify build environment
+        script: |
+          set -euo pipefail
+          xcodebuild -version
+          xcrun --version
+          git --version
+          python3 --version
+          # Shipwright soh/CMakeLists.txt requires cmake_minimum_required 3.26.0.
+          min_cmake=3.26.0
+          cmake_ok() {
+            command -v cmake >/dev/null &&
+              [ "$(printf '%s\n%s\n' "$min_cmake" "$(cmake --version | awk 'NR==1{print $3}')" | sort -V | head -n1)" = "$min_cmake" ]
+          }
+          if ! cmake_ok; then
+            if brew list --formula cmake >/dev/null 2>&1; then brew upgrade cmake; else brew install cmake; fi
+            export PATH="$(brew --prefix)/bin:$PATH"
+            hash -r
+          fi
+          cmake_ok || { echo "CMake >= $min_cmake required, found: $(command -v cmake || echo none)" >&2; exit 1; }
+          # Persist the verified cmake's directory first on PATH for later steps.
+          echo "PATH=$(dirname "$(command -v cmake)"):$PATH" >> "$CM_ENV"
+          command -v cmake
+          cmake --version
+          df -h "$CM_BUILD_DIR"
+
+      - name: Check out fork branch
+        script: |
+          set -euo pipefail
+          mkdir -p "$CM_BUILD_DIR/logs" "$CM_BUILD_DIR/stage0-out"
+          rm -rf "$CM_BUILD_DIR/harkinianpad-src"
+          git clone --branch "$STAGE0_BRANCH" --single-branch --no-tags \
+            "$STAGE0_REPO_URL" "$CM_BUILD_DIR/harkinianpad-src"
+          cd "$CM_BUILD_DIR/harkinianpad-src"
+          test "$(git remote get-url origin)" = "$STAGE0_REPO_URL"
+          test "$(git symbolic-ref --short HEAD)" = "$STAGE0_BRANCH"
+          test "$(git rev-parse HEAD)" = "$(git rev-parse "refs/remotes/origin/$STAGE0_BRANCH")"
+          test -z "$(git status --porcelain --untracked-files=normal)"
+
+      - name: Record build identity
+        script: |
+          set -euo pipefail
+          cd "$CM_BUILD_DIR/harkinianpad-src"
+          {
+            echo "stage: 0 baseline (no Anchor changes)"
+            echo "repository: $(git remote get-url origin)"
+            echo "branch: $(git symbolic-ref --short HEAD)"
+            echo "commit: $(git rev-parse HEAD)"
+            git log -1 --format='subject: %s%ncommit_date: %cI'
+            echo "sources.lock.json sha256: $(shasum -a 256 sources.lock.json | cut -d' ' -f1)"
+            python3 -c 'import json; [print("pin: %s %s" % (c["name"], c["commit"])) for c in json.load(open("sources.lock.json"))["components"]]'
+            echo "codemagic_build_id: ${CM_BUILD_ID:-unset}"
+            echo "padmint_commit: ${CM_COMMIT:-unset}"
+          } | tee "$CM_BUILD_DIR/logs/stage0-identity.txt"
+
+      - name: Repository safety check
+        script: |
+          set -euo pipefail
+          cd "$CM_BUILD_DIR/harkinianpad-src"
+          scripts/check-repo-safety.sh 2>&1 | tee "$CM_BUILD_DIR/logs/check-repo-safety.log"
+
+      - name: Build unsigned device app
+        script: |
+          set -euo pipefail
+          cd "$CM_BUILD_DIR/harkinianpad-src"
+          scripts/build-ios.sh --device 2>&1 | tee "$CM_BUILD_DIR/logs/build-ios.log"
+
+      - name: Collect app and verify
+        script: |
+          set -euo pipefail
+          cd "$CM_BUILD_DIR/harkinianpad-src"
+          rel=build-ios-soh/soh/Release-iphoneos
+          test -d "$rel/HarkinianPad.app"
+          test -f "$rel/HarkinianPad.build.json"
+          cp "$rel/HarkinianPad.build.json" "$CM_BUILD_DIR/stage0-out/"
+          ditto -c -k --keepParent "$rel/HarkinianPad.app" "$CM_BUILD_DIR/stage0-out/HarkinianPad-stage0-device.app.zip"
+          lipo -info "$rel/HarkinianPad.app/HarkinianPad"
+          echo "built commit: $(git rev-parse HEAD)"
+          python3 -c 'import json; r=json.load(open("'"$rel"'/HarkinianPad.build.json")); print("provenance wrapper:", r["wrapper"])'
+          ls -l "$CM_BUILD_DIR/stage0-out"
+
+    artifacts:
+      - logs/*
+      - stage0-out/*
